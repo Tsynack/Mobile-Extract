@@ -9,6 +9,8 @@ import configparser
 import re
 import magic
 import sqlite3
+import readline
+import glob
 
 def get_config_defaults():
     config = configparser.ConfigParser()
@@ -39,82 +41,77 @@ def enumerate_ios(package_name, output_dir, ip, port, user, password):
     try:
         print(f"    [*] Connecting to {ip}...")
         ssh.connect(ip, port=int(port), username=user, password=password)
-        search_roots = [
-            "/private/var/mobile/Containers/Data/Application",
-            "/private/var/containers/Bundle/Application"
-        ]
-        for root in search_roots:
+        search_roots = {
+            "data":"/private/var/mobile/Containers/Data/Application",
+            "bundle":"/private/var/containers/Bundle/Application"
+        }
+        for label, root in search_roots.items():
             cmd = f"find {root} -name '.com.apple.mobile_container_manager.metadata.plist' -exec grep -l '{package_name}' {{}} + | xargs dirname"
             stdin, stdout, stderr = ssh.exec_command(cmd)
             paths = stdout.read().decode().splitlines()
             if not paths:
                 continue
             for p in paths:
-                extract_ios_files(p, output_dir, ip, port, user, password)
+                extract_ios_files(p, output_dir, ssh, label)
     except Exception as e:
         print(f"     [!] SSH Error: {e}")
     finally:
         ssh.close()
 
-def extract_ios_files(path, output_dir, ip, port, user, password):
-    archive_name = "iOS_data_bundle.tar"
+def extract_ios_files(path, output_dir, ssh, label):
+    archive_name = f"iOS_{label}.tar"
     remote_tmp_path = f"/tmp/{archive_name}"
-    local_path = os.path.join(output_dir, "iOS")
     
-    if not os.path.exists(local_path):
-        os.makedirs(local_path)
+    # Base folder for logs (e.g., .../output/iOS/)
+    ios_root = os.path.join(output_dir, "iOS")
+    # Folder for extracted files (e.g., .../output/iOS/data/)
+    local_extraction_root = os.path.join(ios_root, label)
+    
+    if not os.path.exists(local_extraction_root):
+        os.makedirs(local_extraction_root)
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    
     try:
-        ssh.connect(ip, port=int(port), username=user, password=password)
+        remote_parent_dir = os.path.dirname(path)
+        folder_name = os.path.basename(path)
         
-        print(f"    [*] Archiving {path} on iPhone...")
-        formatted_path = path.lstrip('/')
-        tar_cmd = f"tar -cf {remote_tmp_path} -C / {formatted_path}"
+        print(f"    [*] Archiving {label} folder ({folder_name}) on iPhone...")
+        tar_cmd = f"tar -cf {remote_tmp_path} -C {remote_parent_dir} {folder_name}"
         stdin, stdout, stderr = ssh.exec_command(tar_cmd)
         
         if stdout.channel.recv_exit_status() == 0:
-            local_tar_path = os.path.join(local_path, archive_name)
-            print(f"    [*] Downloading bundle to {local_tar_path}...")
+            local_tar_path = os.path.join(local_extraction_root, archive_name)
+            print(f"    [*] Downloading to {local_tar_path}...")
             
             with SCPClient(ssh.get_transport()) as scp:
                 scp.get(remote_tmp_path, local_path=local_tar_path)
                 
+            print(f"    [*] Extracting files locally...")
             with tarfile.open(local_tar_path, "r:") as tar:
-                for member in tar.getmembers():
-                    if member.isfile() or member.isdir() or member.islnk() or member.issym():
-                        try:
-                            tar.extract(member, path=local_path)
-                        except Exception:
-                            pass 
+                tar.extractall(path=local_extraction_root)
             
-            print(f"    [+] Extraction successful in: {local_path}")
-            # cleanup temp file from device
+            actual_local_files = os.path.join(local_extraction_root, folder_name)
+            print(f"    [+] Extraction successful: {actual_local_files}")
+
             ssh.exec_command(f"rm {remote_tmp_path}")
             
-            # enumerate the DB files in the data directories
-            db_log = enumerate_db(local_path, path)
-            # extract plists from the DB files
-            db_extract_plists(local_path, db_log)
-
-            print(f"    [*] Searching for embedded plists")
-            parse_plists(local_path, path)
-            print(f"    [*] Searching for database files")
-
-
+            # --- Analysis Logic ---
+            # We pass ios_root for logs, but actual_local_files for scanning
+            print(f"    [*] Searching for database files...")
+            db_log = enumerate_db(actual_local_files, ios_root)
             
-    except Exception as e:
-        print(f" [!] Extraction failed: {e}")
-    finally:
-        ssh.close()
+            print(f"    [*] Extracting plists from DBs...")
+            db_extract_plists(ios_root, db_log)
 
-def parse_plists(output_dir, path):
-    local_files = os.path.join(output_dir, path.lstrip('/'))
-    log_file = os.path.join(output_dir, "plist_files.txt")
+            print(f"    [*] Searching for embedded plists...")
+            parse_plists(actual_local_files, ios_root)
+
+    except Exception as e:
+        print(f"    [!] Extraction failed: {e}")
+
+def parse_plists(scan_dir, log_dir):
+    log_file = os.path.join(log_dir, "plist_files.txt")
     
-    for root, dirs, files in os.walk(local_files):
+    for root, dirs, files in os.walk(scan_dir):
         for file in files:
             file_path = os.path.join(root, file)
             is_plist = file.endswith('.plist')
@@ -122,42 +119,26 @@ def parse_plists(output_dir, path):
             if not is_plist:
                 try:
                     with open(file_path, 'rb') as f:
-                        # look for magic bytes at the start of the file to define a binary plist or xml plist
                         header = f.read(8)
                         if header.startswith(b'bplist') or header.startswith(b'<?xml'):
-                            try:
-                                with open(file_path, 'rb') as f:
-                                    data = plistlib.load(f)
-                                # some files might match the magic bytes, but are not plists. Attempting to dump the plist iwll determine if its actually a plist.     
-                                plistlib.dumps(data, fmt=plistlib.FMT_XML)    
-                                is_plist = True
-                            except Exception:
-                                is_plist = False  
-                except Exception:
-                    continue
+                            is_plist = True
+                except: continue
 
             if is_plist:
+                rel_path = os.path.relpath(file_path, log_dir)
+                
                 try:
-                    # open the log_file in 'append' mode and add the file_path for the plist
                     with open(log_file, "a", encoding="utf-8") as f_log:
-                        f_log.write(file_path + "\n")
-                except Exception as log_err:
-                    print(f"    [!] Failed to log {file}: {log_err}")
-                try:
-                    extract_embedded_plists(file_path,log_file)
+                        f_log.write(rel_path + "\n")
+                    
+                    extract_embedded_plists(file_path, log_file, log_dir)
                     convert_plistXML(file_path)
-                except Exception as conv_err:
-                    print(f"    [!] Failed to convert:\n        {file}\n        {conv_err}")
-    print(f"    [+] plists converted to XML")   
-    print(f"        [+] full list of plists saved to: {log_file}")
+                except: continue
+
+    print(f"    [+] Plists processed. Log: {log_file}")
 
 def convert_plistXML(file_path):
-    """
-    Converts binary plists to XML, handling special Apple UID types 
-    found in NSKeyedArchiver plists.
-    """
     def patch_uid(obj):
-        """Recursively convert plistlib.UID objects into standard integers."""
         if isinstance(obj, dict):
             return {k: patch_uid(v) for k, v in obj.items()}
         elif isinstance(obj, list):
@@ -180,143 +161,197 @@ def convert_plistXML(file_path):
     except Exception as e:
         print(f"        [!] Failed to convert:\n        {file_path}\n        {e}")
 
-def extract_embedded_plists(file_path, log_file):
-    BPLIST_MAGIC = b'bplist00'
-    
-    def patch_uid(obj):
+def extract_embedded_plists(file_path, log_file, log_dir):
+    def find_and_save_blobs(obj, parent_path, count):
         if isinstance(obj, dict):
-            return {k: patch_uid(v) for k, v in obj.items()}
+            for k, v in obj.items():
+                count = find_and_save_blobs(v, f"{parent_path}_{k}", count)
         elif isinstance(obj, list):
-            return [patch_uid(x) for x in obj]
-        elif hasattr(obj, 'data') and 'UID' in str(type(obj)):
-            return obj.data
-        return obj
+            for i, v in enumerate(obj):
+                count = find_and_save_blobs(v, f"{parent_path}_{i}", count)
+        elif isinstance(obj, bytes) and obj.startswith(b'bplist00'):
+            try:
+                embedded_plist = plistlib.loads(obj)
+                out_name = f"{file_path}_extracted_{count}.plist"
+                
+                with open(out_name, 'wb') as out_f:
+                    plistlib.dump(patch_uid(embedded_plist), out_f, fmt=plistlib.FMT_XML)
+                
+                # --- CALC RELATIVE PATH ---
+                rel_out_path = os.path.relpath(out_name, log_dir)
+                
+                with open(log_file, "a", encoding="utf-8") as f_log:
+                    f_log.write(rel_out_path + "\n")
+                
+                print(f"        [+] Extracted: {rel_out_path}")
+                count += 1
+                count = find_and_save_blobs(embedded_plist, out_name, count)
+            except:
+                pass
+        return count
 
     try:
         with open(file_path, 'rb') as f:
+            data = plistlib.load(f)
+        find_and_save_blobs(data, file_path, 1)
+    except:
+        # Fallback for concatenated files (like data.data)
+        raw_byte_scan(file_path, log_file, log_dir)
+
+def raw_byte_scan(file_path, log_file, log_dir):
+    """Fallback for concatenated plists, logging relative paths."""
+    BPLIST_MAGIC = b'bplist00'
+    try:
+        with open(file_path, 'rb') as f:
             content = f.read()
-            
+        
         matches = [m.start() for m in re.finditer(BPLIST_MAGIC, content)]
         if not matches or (len(matches) == 1 and matches[0] == 0):
             return
-        
-        embedded_count = 0
-        for start_index in matches:
-            if start_index == 0: 
-                continue
-                
-            embedded_count += 1
-            sub_data = content[start_index:]
-            
-            try:
-                # Load the raw sub-data
-                plist_data = plistlib.loads(sub_data)
-                # Patch any UIDs found in the embedded plist
-                patched_data = patch_uid(plist_data)
-                
-                out_name = f"{file_path}_embedded_{embedded_count}.plist"
-                with open(out_name, 'wb') as out_f:
-                    plistlib.dump(patched_data, out_f, fmt=plistlib.FMT_XML)
-                
-                try:
-                    with open(log_file, "a", encoding="utf-8") as f_log:
-                        f_log.write(out_name + "\n")
-                    # Optional: Comment out the line below to reduce console noise
-                    # print(f"    [+] Extracted embedded: {os.path.basename(out_name)}")
-                except Exception as log_err:
-                    print(f"    [!] Failed to log {os.path.basename(out_name)}: {log_err}") 
-            except:
-                continue
-    except:
-        pass
 
-def enumerate_db(output_dir, path):
-    local_files = os.path.join(output_dir, path.lstrip('/'))
-    # create a log in the output directory
-    log_file = os.path.join(output_dir, "DB_files.txt")
+        for i, start_index in enumerate(matches):
+            if start_index == 0: continue 
+            try:
+                sub_data = content[start_index:]
+                plist_data = plistlib.loads(sub_data)
+                out_name = f"{file_path}_raw_{i}.plist"
+                
+                with open(out_name, 'wb') as out_f:
+                    plistlib.dump(patch_uid(plist_data), out_f, fmt=plistlib.FMT_XML)
+                
+                # --- CALC RELATIVE PATH ---
+                rel_out_path = os.path.relpath(out_name, log_dir)
+                
+                with open(log_file, "a", encoding="utf-8") as f_log:
+                    f_log.write(rel_out_path + "\n")
+            except: continue
+    except: pass
+    """Fallback for files that aren't plists but contain plists (concatenated)"""
+    BPLIST_MAGIC = b'bplist00'
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        matches = [m.start() for m in re.finditer(BPLIST_MAGIC, content)]
+        # If the file starts with bplist and has no other matches, we already processed it
+        if not matches or (len(matches) == 1 and matches[0] == 0):
+            return
+
+        for i, start_index in enumerate(matches):
+            if start_index == 0: continue 
+            try:
+                sub_data = content[start_index:]
+                plist_data = plistlib.loads(sub_data)
+                out_name = f"{file_path}_raw_{i}.plist"
+                with open(out_name, 'wb') as out_f:
+                    plistlib.dump(patch_uid(plist_data), out_f, fmt=plistlib.FMT_XML)
+                with open(log_file, "a", encoding="utf-8") as f_log:
+                    f_log.write(out_name + "\n")
+            except: continue
+    except: pass
+
+def enumerate_db(scan_dir, log_dir):
+    log_file = os.path.join(log_dir, "DB_files.txt")
     
-    # 'walk' through the extracted files
-    for root, dirs, files in os.walk(local_files):
+    with open(log_file, "a", encoding="utf-8") as f_log:
+        f_log.write(f"")
+
+    for root, dirs, files in os.walk(scan_dir):
         for file in files:
             file_path = os.path.join(root, file)
             is_db = file.lower().endswith(('.db', '.sqlite', '.sqlite3'))
             
-
             if not is_db:
                 try:
                     with open(file_path, 'rb') as f:
-                        # check the file header
-                        header = f.read(16)
-                        if header.startswith(b'SQLite format 3'):
+                        if f.read(16).startswith(b'SQLite format 3'):
                             is_db = True
-                except Exception:
-                    pass # do nothing because its not a db
-                try:
-                    file_type_checker = magic.Magic()
-                    # check the file description
-                    file_description = file_type_checker.from_file(file_path)
-                
-                    if 'SQLite 3.x database' in file_description:
-                        is_db = True
-                except (OSError, PermissionError):
-                    # Skip files we can't access
-                    continue
+                except: continue
 
             if is_db:
-                try:
-                    # open the log_file in 'append' mode and add the file_path for the plist
-                    db_path = os.path.relpath(file_path, output_dir)
-                    with open(log_file, "a", encoding="utf-8") as f_log:
-                        f_log.write(db_path + "\n")
-                except Exception as log_err:
-                    print(f"         [!] Failed to log {file}: {log_err}")
-    print(f"         [+] DB files logged to: {log_file}")
+                rel_path = os.path.relpath(file_path, log_dir)
+                
+                with open(log_file, "a", encoding="utf-8") as f_log:
+                    f_log.write(rel_path + "\n")
     return log_file
 
-def db_extract_plists(output_dir, log_file):
-    new_folder = os.path.join(output_dir, "db_extracted_plists")
+def db_extract_plists(ios_dir, log_file):
+    # Create the central extraction folder inside the iOS directory
+    new_folder = os.path.join(ios_dir, "db_extracted_plists")
     os.makedirs(new_folder, exist_ok=True)
     
+    if not os.path.exists(log_file):
+        print(f"    [!] DB log file not found: {log_file}")
+        return
+
+    print(f"    [*] Extracting plists from databases listed in {os.path.basename(log_file)}...")
+
     with open(log_file, "r", encoding="utf-8") as f:
         for line in f:
-            relative_path = line.strip()
-            # Construct the absolute path to the local extracted file
-            file_path = os.path.join(output_dir, relative_path)
+            rel_path = line.strip()
+
+            # Reconstruct the absolute path so Python can open the file
+            full_db_path = os.path.join(ios_dir, rel_path)
             
-            if not os.path.exists(file_path):
-                print(f"    [!] File not found: {file_path}")
+            if not os.path.exists(full_db_path):
+                # Optional: print(f"    [!] Skipping (not found): {rel_path}")
                 continue
 
-            base_name = os.path.basename(file_path)
+            # Create a subfolder for this specific database's findings
+            base_name = os.path.basename(full_db_path)
             output_subdir = os.path.join(new_folder, f"{base_name}_plists")
-            os.makedirs(output_subdir, exist_ok=True)
+            
             try:
-                conn = sqlite3.connect(file_path)
+                conn = sqlite3.connect(full_db_path)
                 cursor = conn.cursor()
+                
+                # Get all table names
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 tables = cursor.fetchall()
+                
+                extracted_from_this_db = 0
+                
                 for table_name in tables:
                     table = table_name[0]
+                    # Get column info for the table
                     cursor.execute(f"PRAGMA table_info('{table}');")
                     columns = cursor.fetchall()
+                    
                     for column in columns:
                         col_name = column[1]
+                        # Query the data from this column
                         cursor.execute(f"SELECT {col_name} FROM {table};")
                         rows = cursor.fetchall()
+                        
                         for idx, row in enumerate(rows):
                             data = row[0]
+                            # Check if the blob is a binary plist
                             if isinstance(data, bytes) and data.startswith(b'bplist00'):
                                 try:
                                     plist_data = plistlib.loads(data)
+                                    
+                                    # Ensure the subdir exists only if we actually find a plist
+                                    if not os.path.exists(output_subdir):
+                                        os.makedirs(output_subdir, exist_ok=True)
+                                    
+                                    # Clean filename: Table_Column_Row.plist
                                     out_name = os.path.join(output_subdir, f"{table}_{col_name}_row{idx+1}.plist")
+                                    
                                     with open(out_name, 'wb') as out_f:
                                         plistlib.dump(plist_data, out_f, fmt=plistlib.FMT_XML)
+                                    
+                                    extracted_from_this_db += 1
                                 except Exception:
                                     continue
+                
                 conn.close()
+                if extracted_from_this_db > 0:
+                    print(f"         [+] Extracted {extracted_from_this_db} plists from {base_name}")
+                    
             except Exception as e:
-                print(f"         [!] Failed to extract plists from {file_path}: {e}")
-        print(f"         [+] Extracted plists from DB to: {new_folder}")
+                print(f"         [!] Failed to process DB {base_name}: {e}")
+
+    print(f"    [+] DB plist extraction complete. Results in: {new_folder}")
 
 def enumerate_android(package_name, output_path):
     print(f"    [*] Targeting Android for package: {package_name}")
@@ -446,6 +481,36 @@ def enumeratePackages(is_ios, ip, port, user, password, hide_apple=False):
     
     return sorted(list(set(package_list)))
 
+def path_completer(text, state):
+    orig_text = text
+    expanded = os.path.expanduser(text)
+    matches = glob.glob(expanded + '*')
+
+    results = []
+    for m in matches:
+        if os.path.isdir(m):
+            m += '/'
+        # correcting phantom characters, keeping relative path the same rather than overwriting with absolute path
+        if orig_text.startswith('~'):
+            home = os.path.expanduser('~')
+            m = m.replace(home, '~', 1)
+        results.append(m)
+
+    try:
+        return results[state]
+    except IndexError:
+        return None
+
+def patch_uid(obj):
+    # Recursively converts Apple UID objects to standard data types for XML export
+    if isinstance(obj, dict):
+        return {k: patch_uid(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [patch_uid(x) for x in obj]
+    elif hasattr(obj, 'data') and 'UID' in str(type(obj)):
+        return obj.data
+    return obj
+
 def interactive_session():
     header = r"""
     -------------------------------------------
@@ -459,12 +524,12 @@ def interactive_session():
     -------------------------------------------
     """
     print(header)
-    
+    print("Setting up device config")
     # 1. Platform
-    p_choice = input("What platform [1. Android, 2. iOS]: ").strip()
-    is_ios = (p_choice == "2")
+    p_choice = input("    [1. Android]\n    [2. iOS]\n What platform: ").strip()
+    is_ios = (p_choice == "2" or p_choice.lower() == "ios")
     
-    # 2. Config & iOS Display
+    # 2. Config for iOS
     conf = get_config_defaults()
     ip, port, user, password = conf['ip'], conf['port'], conf['user'], conf['pass']
     hide_apple = conf['hide_apple']
@@ -516,10 +581,20 @@ def interactive_session():
         print("     [!] No package provided. Exiting.")
         return
 
-    # 5. Output
+    # 5. Output directory
     default_out = os.getcwd()
+    readline.set_completer_delims(' \t\n;')
+
+    # setup autocomplete for user input
+    if 'libedit' in readline.__doc__:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+
+    readline.set_completer(path_completer)
     output_path = input(f"\nOutput directory [{default_out}]: ").strip() or default_out
-    output_path = os.path.abspath(output_path)
+    expanded_path = os.path.expanduser(output_path)
+    output_path = os.path.abspath(expanded_path)
 
     # 6. Run
     print(f"\n    [*] Starting extraction for {package_to_test}...")
@@ -532,7 +607,7 @@ def interactive_session():
     Done!
     -------------------------------------------
     """
-    print 
+    print(footer)
 
 if __name__ == "__main__":
     try:
