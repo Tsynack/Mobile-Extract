@@ -199,7 +199,6 @@ def extract_embedded_plists(file_path, log_file, log_dir):
         raw_byte_scan(file_path, log_file, log_dir)
 
 def raw_byte_scan(file_path, log_file, log_dir):
-    """Fallback for concatenated plists, logging relative paths."""
     BPLIST_MAGIC = b'bplist00'
     try:
         with open(file_path, 'rb') as f:
@@ -275,127 +274,37 @@ def enumerate_db(scan_dir, log_dir):
                     f_log.write(rel_path + "\n")
     return log_file
 
-def db_extract_plists(ios_dir, log_file):
-    # Create the central extraction folder inside the iOS directory
-    new_folder = os.path.join(ios_dir, "db_extracted_plists")
-    os.makedirs(new_folder, exist_ok=True)
-    
-    if not os.path.exists(log_file):
-        print(f"    [!] DB log file not found: {log_file}")
-        return
-
-    print(f"    [*] Extracting plists from databases listed in {os.path.basename(log_file)}...")
-
-    with open(log_file, "r", encoding="utf-8") as f:
-        for line in f:
-            rel_path = line.strip()
-
-            # Reconstruct the absolute path so Python can open the file
-            full_db_path = os.path.join(ios_dir, rel_path)
-            
-            if not os.path.exists(full_db_path):
-                # Optional: print(f"    [!] Skipping (not found): {rel_path}")
-                continue
-
-            # Create a subfolder for this specific database's findings
-            base_name = os.path.basename(full_db_path)
-            output_subdir = os.path.join(new_folder, f"{base_name}_plists")
-            
-            try:
-                conn = sqlite3.connect(full_db_path)
-                cursor = conn.cursor()
-                
-                # Get all table names
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = cursor.fetchall()
-                
-                extracted_from_this_db = 0
-                
-                for table_name in tables:
-                    table = table_name[0]
-                    # Get column info for the table
-                    cursor.execute(f"PRAGMA table_info('{table}');")
-                    columns = cursor.fetchall()
-                    
-                    for column in columns:
-                        col_name = column[1]
-                        # Query the data from this column
-                        cursor.execute(f"SELECT {col_name} FROM {table};")
-                        rows = cursor.fetchall()
-                        
-                        for idx, row in enumerate(rows):
-                            data = row[0]
-                            # Check if the blob is a binary plist
-                            if isinstance(data, bytes) and data.startswith(b'bplist00'):
-                                try:
-                                    plist_data = plistlib.loads(data)
-                                    
-                                    # Ensure the subdir exists only if we actually find a plist
-                                    if not os.path.exists(output_subdir):
-                                        os.makedirs(output_subdir, exist_ok=True)
-                                    
-                                    # Clean filename: Table_Column_Row.plist
-                                    out_name = os.path.join(output_subdir, f"{table}_{col_name}_row{idx+1}.plist")
-                                    
-                                    with open(out_name, 'wb') as out_f:
-                                        plistlib.dump(plist_data, out_f, fmt=plistlib.FMT_XML)
-                                    
-                                    extracted_from_this_db += 1
-                                except Exception:
-                                    continue
-                
-                conn.close()
-                if extracted_from_this_db > 0:
-                    print(f"         [+] Extracted {extracted_from_this_db} plists from {base_name}")
-                    
-            except Exception as e:
-                print(f"         [!] Failed to process DB {base_name}: {e}")
-
-    print(f"    [+] DB plist extraction complete. Results in: {new_folder}")
-
 def enumerate_android(package_name, output_path):
     print(f"    [*] Targeting Android for package: {package_name}")
     
-    # Define the absolute internal path and the external data path
     search_roots = [
-        f"/data/user/0/{package_name}",
-        f"/storage/emulated/0/Android/data/{package_name}"
+        {"path": f"/data/user/0/{package_name}", "label": "data"},
+        {"path": f"/storage/emulated/0/Android/data/{package_name}", "label": "storage"}
     ]
     
-    for remote_path in search_roots:
-        # Check if the directory exists
-        check_cmd = ["adb", "shell", f"su -c 'ls -d {remote_path}'"]
-        
-        try:
-            result = subprocess.run(check_cmd, capture_output=True, text=True)
-            
-            # If this works we have root access and can pull the files
-            if result.returncode == 0:
-                found_path = result.stdout.strip()
-                print(f"    [+] Found path: {found_path}")
-                
-                # Determine subfolder label (data directory vs external storage)
-                label = "data" if "/data/user/0" in found_path else "storage"
-                android_out = os.path.join(output_path, "Android")
-                
-                os.makedirs(android_out, exist_ok=True)
-                extract_android_files(found_path, label, android_out)
-            # else try to pull external storage with standard user permissions
-            else:
-                print(f"[!] Path not found or inaccessible: {remote_path}")
-                print("    [*] Trying without root access...")
+    android_out = os.path.join(output_path, "Android")
+    os.makedirs(android_out, exist_ok=True)
 
-                if "emulated" in remote_path:
-                    check_cmd_no_root = ["adb", "shell", f"ls -d {remote_path}"]
-                    result = subprocess.run(check_cmd_no_root, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        extract_android_files(remote_path, label, android_out)
-                        continue
-                
-                print(f"[-] Path not found or inaccessible: {remote_path}")
-                
-        except Exception as e:
-            print(f"[!] ADB Error: {e}")
+    for item in search_roots:
+        remote_path = item["path"]
+        label = item["label"]
+        
+        # Check existence via adb shell
+        check_cmd = ["adb", "shell", f"su -c 'ls -d {remote_path}'"]
+        result = subprocess.run(check_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"        [+] Found path: {remote_path}")
+            extract_android_files(remote_path, label, android_out)
+        else:
+            # Fallback for non-root external storage
+            if label == "storage":
+                print(f"    [*] Trying {label} without root...")
+                check_no_root = ["adb", "shell", f"ls -d {remote_path}"]
+                if subprocess.run(check_no_root, capture_output=True).returncode == 0:
+                    extract_android_files(remote_path, label, android_out)
+            else:
+                print(f"    [!] Path inaccessible: {remote_path}")
 
 def extract_android_files(remote_path, label, output_path):
     print(f"    [*] Pulling {label} from {remote_path} to {output_path}...")
@@ -419,11 +328,11 @@ def extract_android_files(remote_path, label, output_path):
                         tar.extract(member, path=output_path)
                     except Exception:
                         pass 
-        print(f"    [+] Extraction successful: {output_path}")
+        print(f"        [+] Extraction successful: {output_path}")
         local_cleanup = ["rm", local_tar_path]
         subprocess.run(local_cleanup)
         print(f"    [*] Looking for DB files")
-        enumerate_db(output_path, remote_path)
+        enumerate_db(output_path, output_path)
     except Exception as e:
         print(f"    [!] Pull failed: {e}")
 
