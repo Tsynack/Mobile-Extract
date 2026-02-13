@@ -1,5 +1,5 @@
 ## Overview:
-Automating the process of extracting files from a mobile device (Android and iOS). THis tool will enumerate package names if needed, identify the data/storage directories and download them to your local device. The output will include a `DB_files.txt` and `plist_files.txt` for those files identified during extraction.  
+Automating the process of extracting files from a mobile device (Android and iOS). This tool will enumerate package names if needed, identify the data/storage directories and download them to your local device. The output will include a `DB_files.txt` and `plist_files.txt` for those files identified during extraction.  
 
 ## Install:
 This tool relies on libmagic for when searching for specific file types. The import within the Python script is a pointer to the library but does not actuially install the binary onto the system. Install of the binary is different based on the OS you are using.  
