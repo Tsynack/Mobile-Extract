@@ -88,7 +88,8 @@ def extract_ios_files(path, output_dir, ssh, label):
             print(f"    [*] Extracting files locally...")
             with tarfile.open(local_tar_path, "r:") as tar:
                 if hasattr(tarfile, 'data_filter'):
-                    tar.extractall(path=local_extraction_root, filter="data")
+                    # filter prevents tar bombs from overwirting system files. 
+                    tar.extractall(path=local_extraction_root, filter="tar")
                 else:
                     # Fallback for older Python versions
                     tar.extractall(path=local_extraction_root)
