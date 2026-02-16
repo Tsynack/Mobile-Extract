@@ -474,6 +474,7 @@ def patch_uid(obj):
     return obj
 
 def extension_search(search_dir, defaults):
+    logs = ['DB_files.txt', 'plist_files.txt', 'extension_search.txt', 'string_search.txt']
     log_file_path = os.path.join(search_dir, "extension_search.txt")
     if defaults == 'y' or defaults == '':
         extensions = ['.txt', '.json', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.xml', '.log']
@@ -501,8 +502,11 @@ def extension_search(search_dir, defaults):
         f.write(f"\n--- Search for: {header} ---\n")
         for root, dirs, files in os.walk(search_dir):
             for file in files:
+                if file in logs:
+                        continue
                 if any(file.lower().endswith(ext) for ext in extensions):
-                    f.write(os.path.join(root, file) + '\n')
+                    rel_path = os.path.relpath(os.path.join(root, file), search_dir)
+                    f.write(rel_path + '\n')
         print(f"        [+] Extension search complete. Log: {log_file_path}")
 
 def string_search(search_dir):
@@ -624,11 +628,11 @@ def interactive_session():
         enumerate_android(package_to_test, output_path)
 
     # 7. Next Steps 
+    if is_ios:
+        output_path = os.path.join(output_path, 'iOS')
+    else:
+        output_path = os.path.join(output_path, 'Android')
     while True:
-        if is_ios:
-            output_path = os.path.join(output_path, 'iOS')
-        else:
-            output_path = os.path.join(output_path, 'Android')
         choice = input("\nWhat do you want to do next?\n"
                     "   [1. Search for File Extensions]\n"
                     "   [2. Search for Strings]\n"
@@ -637,10 +641,7 @@ def interactive_session():
 
         if choice == '1':
                 default_ext_search = input("Search for default extensions (.txt, .json, .pdf, .doc, .docx, .ppt, .xls, .xlsx, .xml, .log)? [Y/n]: ").strip().lower()
-                if is_ios:
-                    extension_search(output_path, default_ext_search)
-                else:
-                    extension_search(output_path, default_ext_search)
+                extension_search(output_path, default_ext_search)
         elif choice == '2':
             string_search(output_path)
         elif choice == '3' or choice.lower() == 'exit':
