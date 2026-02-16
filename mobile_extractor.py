@@ -1,3 +1,4 @@
+from email import header
 import paramiko
 from scp import SCPClient
 import subprocess
@@ -420,7 +421,9 @@ def enumeratePackages(is_ios, ip, port, user, password, hide_apple=False):
                         package_list.append(pkg_id)
 
         except Exception as e:
-            print(f"[!] Error: {e}")
+            print(f"     [!] Could Not Connect to SSH")
+            sys.exit(0)
+            #print(f"[!] Error: {e}")
         finally:
             ssh.close()
     else:
@@ -470,9 +473,67 @@ def patch_uid(obj):
         return obj.data
     return obj
 
+def extension_search(search_dir, defaults):
+    log_file_path = os.path.join(search_dir, "extension_search.txt")
+    if defaults == 'y' or defaults == '':
+        extensions = ['.txt', '.json', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.xml', '.log']
+    else:
+        extensions = []
+        while True:
+            ext = input("Enter extension (e.g., .db, .json) or 'done' to continue: ").strip()
+            if ext.lower() == "exit":
+                return
+            if ext.lower() == "done" or ext == "":
+                break
+            if ext:
+                if not ext.startswith('.'):
+                    ext = f".{ext}"
+                extensions.append(ext)
+
+            else:
+                break
+
+    if not extensions:
+        print("    [!] No extensions provided. Returning to menu.")
+        return
+    with open(log_file_path, 'a', encoding='utf-8') as f:
+        header = ", ".join(extensions)
+        f.write(f"\n--- Search for: {header} ---\n")
+        for root, dirs, files in os.walk(search_dir):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in extensions):
+                    f.write(os.path.join(root, file) + '\n')
+        print(f"        [+] Extension search complete. Log: {log_file_path}")
+
+def string_search(search_dir):
+    log_file_path = os.path.join(search_dir, "string_search.txt")
+    logs = ['DB_files.txt', 'plist_files.txt', 'extension_Search.txt', 'string_search.txt']
+    while True:
+        search_string = input("Enter string to search for (or 'exit' to return): ").strip()
+        if search_string.lower() == "exit" or search_string == "":
+            print("    [!] No search string provided. Returning to menu.")
+            return
+        with open(log_file_path, 'a', encoding='utf-8') as log:
+            log.write(f"\n--- Search for: {search_string} ---\n")
+            for root, dirs, files in os.walk(search_dir):
+                for file in files:
+                    # Avoid catching strings within our own log files.
+                    if file in logs:
+                        continue
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            # Case-insensitive search
+                            if search_string.lower() in content.lower():
+                                rel_path = os.path.relpath(file_path, search_dir)
+                                print(f"        [+] Found in: {rel_path}")
+                                log.write(rel_path + '\n')
+                    except: continue
+
 def interactive_session():
     header = r"""
-    -------------------------------------------
+-----------------------------------------------
       __  __  ____  ____  _____ _      ______ 
      |  \/  |/ __ \|  _ \|_   _| |    |  ____|
      | \  / | |  | | |_) | | | | |    | |__   
@@ -480,7 +541,7 @@ def interactive_session():
      | |  | | |__| | |_) |_| |_| |____| |____ 
      |_|  |_|\____/|____/|_____|______|______|
             > MOBILE_DATA_EXTRACTOR_v1 <
-    -------------------------------------------
+-----------------------------------------------
     """
     print(header)
     print("Setting up device config")
@@ -561,10 +622,37 @@ def interactive_session():
         enumerate_ios(package_to_test, output_path, ip, port, user, password)
     else:
         enumerate_android(package_to_test, output_path)
+
+    # 7. Next Steps 
+    while True:
+        if is_ios:
+            output_path = os.path.join(output_path, 'iOS')
+        else:
+            output_path = os.path.join(output_path, 'Android')
+        choice = input("\nWhat do you want to do next?\n"
+                    "   [1. Search for File Extensions]\n"
+                    "   [2. Search for Strings]\n"
+                    "   [3. Exit]\n"
+                    "Choice: ").strip()
+
+        if choice == '1':
+                default_ext_search = input("Search for default extensions (.txt, .json, .pdf, .doc, .docx, .ppt, .xls, .xlsx, .xml, .log)? [Y/n]: ").strip().lower()
+                if is_ios:
+                    extension_search(output_path, default_ext_search)
+                else:
+                    extension_search(output_path, default_ext_search)
+        elif choice == '2':
+            string_search(output_path)
+        elif choice == '3' or choice.lower() == 'exit':
+            print("Exiting...")
+            break
+        else:
+            print("Invalid choice, please try again.")
+
     footer = r"""
-    -------------------------------------------
-    Done!
-    -------------------------------------------
+-------------------------------------------
+Done!
+-------------------------------------------
     """
     print(footer)
 
